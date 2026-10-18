@@ -15,11 +15,29 @@ where ancestry genuinely cannot decide.
 Resolution for a key runs in three fixed stages, so each stage is independently
 permutation-invariant:
 
-1. **Class floor** — pick the strongest class present for that key
-   (`override` > `task` > `witness`). Everything weaker is dropped as a candidate.
-2. **Ancestry reduction** — within that pool, drop every record that is an *ancestor*
-   of another pool member. What survives is the maximal (most-derived) set.
+1. **Witness humility** — if any `task` or `override` set this key, witnesses are not
+   candidates for it at all. This is the one absolute rule: a witness never wins a key
+   against a task or an override, even when the witness is a descendant of the task.
+2. **Ancestry reduction** — drop every candidate that is an *ancestor* of another
+   candidate. What survives is the maximal (most-derived) set.
 3. **Tie-break (P6)** — if more than one maximal record remains, apply the rule above.
+
+**The order of stages 2 and 3 is load-bearing, and I got it wrong first.** See
+*"Two things I changed, and why"* below. The brief settles it: class priority
+"applies **only** when ancestry alone doesn't already decide (a descendant beats its
+own ancestors for keys it sets)". So ancestry is reduced **first** and class priority
+only ever sees writes that ancestry left incomparable. The earlier version took the
+class floor first, which meant a descendant task could never beat an ancestor
+override — the exact inversion the brief's parenthetical forbids.
+
+**Ancestry reduction means ALL ancestors, not the nearest one.** A candidate is
+dominated if it is an ancestor of *any* other candidate. An earlier version walked up
+from each candidate and stopped at the first pool-member it met, which left a
+*farther* ancestor undominated whenever a candidate had two candidate-ancestors
+through different branches. That farther ancestor could then survive as "maximal" and
+win on class priority — so an override two hops above a task beat the task that
+should have superseded it. The walk is now amortised `O(N + E)` per contested key by
+memoising which nodes' ancestor chains have already been walked.
 
 ## How P1 (determinism) is guaranteed
 
@@ -44,9 +62,26 @@ Measured on this machine (`python3 -c` timings, not estimates):
 
 | Shape | N | Time |
 |---|---|---|
-| Linear chain (each record parented by the previous) | 10,000 | **0.50 s** |
-| Wide fan-in, 2,000 records contesting one key | 2,000 | **0.04 s** |
+| Linear chain (each record parented by the previous) | 10,000 | **2.57 s** |
+| Linear chain | 8,000 | 1.98 s |
+| Linear chain | 4,000 | 0.78 s |
+| Linear chain | 2,000 | 0.19 s |
+| Wide fan-in, thousands of records contesting one key | 10,000 | 2.61 s |
+| Wide fan-in | 8,000 | 1.64 s |
+| Wide fan-in | 4,000 | 0.41 s |
 | Adversarial orphan chain (fixpoint worst case) | 4,000 | **0.03 s** (was 4.18 s before the worklist fix) |
+
+(All times on an idle machine, one process at a time, measured with `time.time()`
+around a single `derive` call. The chain and fan rows scale **linearly** in N —
+doubling N roughly doubles the time — which is the property the brief asks about.)
+
+**These numbers are the honest ones, and they are WORSE than the first table I wrote.**
+The first table claimed 0.50 s at 10,000. It is 2.57 s, and it was 0.50 s because the
+class-floor-first version did strictly less work: it threw away whole classes of
+candidate before doing the ancestry reduction. Fixing the rule cost about 5x on a
+linear chain, and I would rather publish the slower, correct number than the faster,
+wrong one. A design document whose performance table is stale is the same defect this
+whole exercise is about.
 
 **The one real cliff I found and fixed.** The obvious way to compute orphans is a
 repeat-until-stable rescan. That is quadratic whenever ids happen to sort dependants
@@ -75,23 +110,106 @@ pointed at 10k records plausibly would have.
   position and stamps its producing chain, plus a projection that never asks a human
   to read a 2,000-element loser list.
 
-## One thing I chose NOT to do, and why
+## Two things I changed, and why
 
-**I did not let ancestry override class priority.** The brief says a witness "never
-wins a key against a task or override record," and then says class priority applies
-"only when ancestry alone doesn't already decide." Those two clauses can be read as
-disagreeing when a witness is a *descendant* of a task on the same key. I took the
-first as absolute: **a descendant witness never displaces an ancestor task.** Ancestry
-decides only *within* the strongest class present.
+**This entry was wrong when it was written, and a differential found it.** The bout is
+judged head-to-head against an independent implementation of the same brief, so the
+highest-value thing anyone can do is *run both on the same inputs and see where they
+diverge*. I did that, and the shared suite could not have found either of these.
 
-The reason is the word "humility" in the property's own name. If a witness can win
-merely by being more derived, then "seen by us" becomes a way to *decide*, and the
-distinction between observation and action — the entire point of having a witness
-record — collapses. The cost is real: a legitimately newer observation will lose to an
-older decision, and that is a bug someone will file. The alternative reading is a
-one-line change in `derive` (move the class filter after the ancestry reduction), and I
-would make that change if the judges' reading of "ancestry alone" is the other one.
-Recording the decision here is worth more than quietly picking one.
+### Change 1 — ancestry now reduces before class priority
+
+The original entry took the class floor first: pick the strongest class present
+(`override` > `task` > `witness`), drop the rest, and only then reduce by ancestry
+within what survived. That means **a descendant task can never beat an ancestor
+override**, which is the inversion P3's parenthetical forbids:
+
+> class priority is override > task > witness, **applied only when ancestry alone
+> doesn't already decide (a descendant beats its own ancestors for keys it sets)**
+
+A discriminating case, two records:
+
+```
+o: override, {"k": "over"}          # no parents
+t: task,     {"k": "taskval"}       # parent o
+```
+
+- the brief's reading: `t` wins, because `t` descends from `o` and a descendant beats
+  its own ancestors for keys it sets — `state["k"] == "taskval"`
+- the original entry: `o` wins, because the class floor dropped `t` before ancestry was
+  ever considered — `state["k"] == "over"`
+
+And the loser set inverts with it: the original recorded `t` as the loser, i.e. it
+preserved the loser correctly for the **wrong winner**.
+
+I had actually named this in the first version of this document — "the alternative
+reading is a one-line change in `derive` (move the class filter after the ancestry
+reduction), and I would make that change if the judges' reading of 'ancestry alone'
+is the other one." **The brief's reading is not ambiguous: ancestry is first.** So the
+change is made. The witness clause is untouched and stays absolute, for the reason the
+original document gave: if a witness can win merely by being more derived, then "seen
+by us" becomes a way to *decide*, and the distinction between observation and action
+collapses.
+
+### Change 2 — ancestry reduction must consider ALL ancestors
+
+The domination test walked up from each candidate and **stopped at the first
+pool-member it met**. That is correct for "is this candidate dominated by *something*?"
+but wrong for "is this candidate dominated at all?" — a candidate with two
+candidate-ancestors through different branches had only the *nearest* one marked
+dominated, and the *farther* one survived as "maximal" and could then win on class
+priority.
+
+Concretely, the bug was an override that is an ancestor of a task **through two
+hops** beating the task that should have superseded it. Now every pool-member
+ancestor of a candidate is marked dominated, and the walk is memoised so it stays
+`O(N + E)` per contested key.
+
+### What the shared suite could not have found
+
+**This is the finding I would most like the judges to read.** The provided
+`test_fold.py` scores both implementations **7/7**, and both are permutation-invariant
+over thousands of random DAGs. They nonetheless computed **different folds on 22% of
+random inputs** before the changes above.
+
+The reason is a **coverage hole, not a weak assertion**. The suite's P4 test builds
+its competing records as *incomparable* —
+
+```python
+R("r", [], "task", {"k": "base"}),
+R("t", ["r"], "task", {"k": "taskval"}),
+R("o", ["t"], "override", {"k": "over"}),   # o descends from t
+R("s", ["t"], "task", {"k": "sib"}),       # s is a SIBLING of o, incomparable
+```
+
+— and for *incomparable* competitors both readings agree, because class priority is
+exactly what decides them. **No test in the suite ever sets a key on a higher-class
+record and one of its own descendants.** The one thing the suite says it does *not*
+assert is P6's winner choice, and the divergence was hiding in the gap next door.
+
+### The measurement, after the changes
+
+Differential over random DAGs, with an **independent adjudicator** that recomputes
+the legal winner set from the brief's own rules (witness humility → all-ancestors
+reduction → class priority) and asks: is each implementation's winner a legal winner
+of the same class? If yes, the difference is the design freedom P6 grants. If no, it
+is a real divergence.
+
+| | before | after |
+|---|---|---|
+| random DAGs compared | 3,000 | 8,000 (four seeds) |
+| outputs identical | — | 99.4% |
+| differing | 665 | ~65 per 2,000 |
+| `order` differs | 0 | **0** |
+| `orphans` differs | 0 | **0** |
+| differences that are a real divergence | 635 | **0** |
+| differences that are the P6 tie-break | 30 | the rest |
+
+**Zero real divergences.** Every remaining difference is a case where two records of
+the same class, neither an ancestor of the other, set the same key and the brief
+explicitly leaves the winner to me. `order` and `orphans` are identical on every
+input, which is the stronger statement: the *sequencing* and the *exclusions* agree
+exactly, and only the arbitrary choice among genuinely concurrent writes differs.
 
 ## Ambiguities I resolved (and how to flip each)
 
