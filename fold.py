@@ -155,10 +155,15 @@ def derive(records):
 
         # Report a conflict for every key whose applied records disagreed, and
         # preserve every losing setter -- nothing is dropped silently (P5).
-        values = {by_id[r]["effects"][key] for r in ids}
-        if len(ids) >= 2 and len(values) >= 2:
-            losers = sorted(r for r in ids if r != winner)
-            conflicts.append({"key": key, "winner": winner, "losers": losers})
+        # "Disagreed" is tested by equality against the first setter's value,
+        # not by hashing the values into a set: the brief types effect values as
+        # scalars, but an out-of-spec non-scalar (e.g. a nested dict) must be
+        # guarded, not crash the whole derivation with "unhashable type".
+        if len(ids) >= 2:
+            first = by_id[ids[0]]["effects"][key]
+            if any(by_id[r]["effects"][key] != first for r in ids[1:]):
+                losers = sorted(r for r in ids if r != winner)
+                conflicts.append({"key": key, "winner": winner, "losers": losers})
 
     return {
         "state": state,

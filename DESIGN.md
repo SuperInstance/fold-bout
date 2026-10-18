@@ -1,5 +1,27 @@
 # DESIGN — the deterministic fold
 
+## Two readings of the brief (P2, P3–P4)
+
+`TASK.md` fixes two points that a reader should know are deliberate choices,
+because a different substrate could reasonably decide them the other way:
+
+- **Orphans are transitive (P2).** "Any missing ancestor (transitively) is an
+  orphan." A record whose parent is itself an orphan therefore has a missing
+  *ancestor* and is excluded too, and `test_fold.py`'s `p2` pins exactly this
+  (ghost `g` and its child `h` are both orphans). A non-transitive reading —
+  keep an orphan's orderable descendants and "fold on what stands" — is also
+  defensible, but it is a different fold; this entry implements the brief's.
+- **Class precedence is ancestry-first (P3–P4).** A descendant beats its own
+  ancestors for keys it sets; class priority (`override > task > witness`)
+  decides only writes that ancestry leaves *incomparable*. So a descendant task
+  supersedes an ancestor override on the same key, and a descendant witness
+  never beats an ancestor task (witness humility holds regardless). An
+  *absolute* class precedence — override always outranks task, even a task that
+  descends from it — is the alternative reading; it, too, is a different fold.
+
+Both are read straight off the brief's wording; neither is an accident of the
+implementation, and switching either would change observable output.
+
 ## Tie-break rule (P6)
 
 When two records of the **same class** set the same key and neither is an
